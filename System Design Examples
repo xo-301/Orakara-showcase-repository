@@ -1,0 +1,103 @@
+# System Design — Orakara
+
+## Overview
+
+Orakara is a structured B2B procurement platform. Its core technical challenge is not data storage or retrieval — it is *process integrity*: ensuring that two parties with misaligned incentives move through a multi-stage negotiation in a way that is fair, auditable, and resistant to manipulation.
+
+Every architectural decision flows from that requirement.
+
+---
+
+## Decision 1 — Deterministic State Machine over Event-Driven Architecture
+
+### What we chose
+
+The entire negotiation lifecycle is encoded as an explicit, linear state machine with a single orchestrator (`negotiationOrchestrator.ts`) controlling all transitions. Stage progression is synchronous. No transition fires unless all preconditions are validated first.
+
+```
+PENDING → RESPONDED → NEGOTIATING_SPECS → [SAMPLE_REQUESTED] → NEGOTIATING_PRICE → NEGOTIATING_CONTRACT → DEAL_CREATED
+```
+
+Each arrow is a function call. Each function call either succeeds completely or throws and rolls back. There are no partial states.
+
+### Why not event-driven
+
+An event-driven architecture would let subsystems react to domain events independently — a `PriceAgreed` event could trigger the contract stage to initialise, a `TimerExpired` event could fire failure logic automatically, and so on.
+
+The problem is that our stages are not independent. The price stage cannot begin until the spec stage has reached full agreement. The contract stage cannot proceed until price, payment mode, quantity, lead time, and — if PLATFORM_ESCROW — tranche structure are all individually agreed. If those validations are spread across event handlers, the invariants become distributed, and the system can reach incoherent states when handlers execute out of order, retry after partial success, or fail silently.
+
+A practical example: if `PriceAgreed` fires before tranche negotiation completes (because tranches are negotiated in parallel in an event-driven model), the contract stage could initialise with an incomplete payment structure. In the deterministic model, `isPricePaymentAgreed()` checks all four dimensions in a single synchronous gate before any transition is allowed. It is structurally impossible to enter the contract stage with an incomplete price agreement.
+
+### The debugging argument
+
+When a deal enters a bad state in production, the error trace leads to a single function call in `negotiationOrchestrator.ts`. The precondition that failed is explicit. No reasoning about which event fired when, which handler consumed it, or whether the message queue delivered it exactly once.
+
+In an event-driven model, debugging a state inconsistency requires reconstructing a causal chain from async event logs. In a deterministic model, it requires reading one stack trace.
+
+### The cognitive load argument
+
+This matters beyond engineering. One of the core product goals is to reduce the cognitive load on negotiating parties so they can make better-quality decisions — specifically, to help them converge toward the [Kaldor-Hicks efficient outcome](https://en.wikipedia.org/wiki/Kaldor%E2%80%93Hicks_efficiency) where one exists.
+
+A negotiation platform that is itself unpredictable undermines this goal. If users encounter a stage transition that happens at an unexpected moment, or a turn that flips when they did not expect it, they lose confidence in the system and begin second-guessing the process rather than the deal terms. The deterministic model ensures that upon repeated use, the sequence becomes second nature — users build accurate mental models of the system, and those mental models hold under all conditions.
+
+---
+
+## Decision 2 — Prisma ORM over Raw SQL, with Prisma Postgres for Connection Pooling
+
+### What we chose
+
+Prisma ORM as the data access layer, with Prisma Postgres (which includes Prisma Accelerate) as the managed database service.
+
+### Why Prisma ORM
+
+The schema has 50+ models and 40+ enums. Many operations require atomic multi-table writes — for example, recording a negotiation failure involves writing to `NegotiationFailure`, `SpecsFailureDetail`, `AuditLog`, and updating `Inquiry.status` in a single transaction. Prisma's typed client makes these transactions readable and refactorable. Type errors on query shape surface at compile time, not at runtime in production.
+
+Raw SQL would produce equivalent query performance but would require manual type maintenance as the schema evolves. Given the pace of schema iteration during early product development, the overhead of keeping raw SQL in sync with TypeScript types is not justified.
+
+### Why Prisma Postgres specifically — the Bangladesh latency argument
+
+Standard PostgreSQL hosting from providers like Supabase or Neon places the database in a fixed cloud region. For Bangladesh, the nearest available regions are typically Singapore or Mumbai. Round-trip latency from Dhaka to Singapore sits around 50–80ms. For a negotiation engine that may require 3–5 sequential database reads per user action (auth check, inquiry fetch, turn validation, state write, audit log), this compounds to 150–400ms of database latency alone per request.
+
+Prisma Postgres includes Prisma Accelerate — an edge-layer connection pool and query cache distributed globally. Frequently-read data (inquiry state, category specs, country config) can be served from a cache node closer to the user. The connection pool eliminates the cold-connection overhead on serverless functions (a significant penalty with Neon's scale-to-zero model on first query after inactivity).
+
+For an MVP operating in a market with structurally higher latency than Western targets, Prisma Accelerate is the strongest mitigation path available without self-hosting infrastructure.
+
+---
+
+## Decision 3 — Next.js API Routes as the Backend Layer
+
+### What we chose
+
+All backend logic lives inside Next.js API routes (`src/app/api/`), deployed to Vercel. There is no separate backend service.
+
+### Why
+
+At current scale, the operational overhead of maintaining a separate API service (separate deployment, separate CI/CD, cross-origin credential handling, inter-service latency) is not justified. Next.js API routes give us:
+
+- Co-located frontend and backend deployment
+- Shared TypeScript types across the stack (Zod schemas defined once, used for both API validation and client-side form validation)
+- Vercel Cron for the three scheduled jobs (timer expiry every 5 minutes, holiday pause/resume daily, RFQ expiry every 15 minutes) with no additional infrastructure
+
+The separation boundary is logical, not physical: `src/lib/` contains all business logic (orchestrator, failure tracking, cron processors, export utilities) and is never imported by frontend components. API routes are thin handlers that validate input, call `src/lib/` functions, and return responses. This means a future migration to a separate API service requires moving `src/lib/` and the route handlers — the business logic itself does not need to change.
+
+---
+
+## Schema Design Philosophy
+
+The schema is deliberately denormalised in places where query performance at read time matters more than write-time normalisation purity. The `Inquiry` model, for instance, carries turn tracking fields (`specNegotiationTurn`, `priceNegotiationTurn`) directly rather than resolving them via a join. This is intentional: turn validation runs on every state-mutating API call, and the turn fields are needed immediately. Eliminating the join on the hot path is worth the denormalisation cost.
+
+Audit and research data are stored in dedicated models (`AuditLog`, `NegotiationFailure`, `BehavioralEvent`) that are append-only by design. No audit record is ever updated or deleted in application code. This provides an immutable event log independent of the mutable operational state.
+
+---
+
+## Cron Architecture
+
+Three Vercel Cron jobs run the time-sensitive background processes:
+
+| Job | Schedule | What it does |
+|---|---|---|
+| `/api/cron/timers` | Every 5 min | Expires timers, records failures, sends timer warnings |
+| `/api/cron/holidays` | Daily at 18:00 | Pauses / resumes all active timers per country based on holiday calendar |
+| `/api/cron/rfq-expiry` | Every 15 min | Marks stale RFQs as expired |
+
+All three converge in `src/lib/cron/index.ts → runAllCronJobs()`. Each job writes an `AuditLog` record on completion. Timer expiry is idempotent — re-running on an already-expired timer is a no-op.
