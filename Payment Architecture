@@ -1,0 +1,194 @@
+# Payment Architecture — Orakara
+
+## Overview
+
+Orakara supports five payment methods: `OFFLINE`, `MFS` (mobile financial services, e.g. bKash), `BANK_TRANSFER`, `CARD_PAYMENT`, and `PLATFORM_ESCROW`. The first four are off-platform — Orakara records what was agreed but does not move money. `PLATFORM_ESCROW` is fully on-platform: funds are held and released in tranches against verified proof of milestone completion.
+
+Payment method selection is part of the price negotiation. Neither party can proceed to the contract stage until payment method is agreed alongside price, quantity, and lead time.
+
+---
+
+## Payment Method Negotiation
+
+During the price stage, payment mode is treated as a first-class negotiation dimension alongside price, quantity, and lead time. Each dimension has its own status in `PriceNegotiation`:
+
+```
+paymentModeStatus        PriceFieldStatus   — PENDING | COUNTERED | AGREED | FINAL_OFFER_PENDING | ...
+paymentModeAwaitingRole  String             — whose response is expected
+paymentModeFinalOfferBy  String             — userId if final offer triggered
+```
+
+A buyer can propose any payment method in their set of `paymentModesOffered`. A seller can accept, counter with their preferred method, or trigger a final offer. If both parties' `paymentModesOffered` arrays never overlap, the system flags `paymentModeDispute = true` on the eventual `NegotiationFailure` record.
+
+The gate to the contract stage (`isPricePaymentAgreed()`) requires all four dimensions — price, payment mode, quantity, lead time — to be `AGREED`, plus tranche agreement if `PLATFORM_ESCROW` was selected.
+
+---
+
+## Deal Lifecycle
+
+Once a deal is created, its status follows the agreed payment method.
+
+### Non-escrow payment flow (`DealStatus`)
+
+```
+ACTIVE
+  ↓ (buyer initiates payment externally)
+PAYMENT_PENDING
+  ↓ (seller confirms advance payment received)
+IN_PRODUCTION
+  ↓ (seller marks order complete)
+READY_FOR_DELIVERY
+  ↓ (delivery initiated)
+IN_TRANSIT
+  ↓ (package received confirmed)
+DELIVERED
+  ↓ (buyer confirms satisfaction)
+COMPLETED
+```
+
+At any point: `→ DISPUTED` (raised against a milestone) or `→ CANCELLED`.
+
+Each status change creates an `OrderStatusUpdate` record with `updatedBy`, `role`, `proofFiles[]`, and `notes`.
+
+---
+
+## Escrow Tranche System
+
+When `PLATFORM_ESCROW` is the agreed payment method, the deal uses a milestone-gated release structure. Tranches are negotiated during the price stage and then executed as `Milestone` records post-deal.
+
+### Two-phase tranche lifecycle
+
+Tranches exist in two distinct forms:
+
+**Phase 1 — Negotiation (`EscrowTranche`)**
+
+Linked to `PriceNegotiation`. Each tranche is a turn-based negotiation record: buyer proposes an amount, quantity, and lead time per tranche; seller counters or accepts. The same `PriceFieldStatus` turn-based flow applies to each tranche individually. Final-offer grim trigger is available per tranche.
+
+```
+EscrowTranche fields (per tranche):
+  trancheIndex      Int      — sequence (0-indexed)
+  buyerAmount       Decimal  — buyer's proposed amount
+  sellerAmount      Decimal  — seller's counter-proposed amount
+  agreedAmount      Decimal  — set when status → AGREED
+  buyerQuantity     Int      — buyer's proposed qty for this tranche
+  agreedQuantity    Int      — agreed qty
+  agreedLeadTimeMin Int      — agreed lead time range start
+  agreedLeadTimeMax Int      — agreed lead time range end
+  status            PriceFieldStatus
+  awaitingRole      String
+  finalOfferBy      String
+  finalOfferStatus  PriceFinalOfferStatus
+```
+
+**Phase 2 — Execution (`Milestone`)**
+
+Linked to `Deal`. Created from the agreed tranche schedule when the deal is formed. Each milestone governs one payment release.
+
+```
+Milestone fields:
+  sequenceNumber  Int             — order of execution
+  percentage      Decimal         — share of total deal amount
+  amount          Decimal         — absolute amount for this milestone
+  condition       String          — human-readable description
+  expectedDays    Int             — expected days from deal start
+  status          MilestoneStatus — PENDING → AWAITING_PROOF → PROOF_SUBMITTED → APPROVED → PAYMENT_RELEASED
+  proofRequired   Boolean
+  proofSubmitted  String[]        — R2 URLs of submitted proof files
+  proofSubmittedAt DateTime
+  proofSubmittedBy String
+  approvedBy      String
+  approvedAt      DateTime
+  paymentReleased Boolean
+  paymentReleasedAt DateTime
+  disputed        Boolean
+  disputeId       String          — links to DisputeResolution if raised
+```
+
+The `PlatformEscrowContract` record (1:1 with `Deal`) stores the final agreed `trancheSchedule` as JSON and both parties' digital signatures. It is immutable once both parties have signed.
+
+---
+
+## Proof-Gated Release Flow
+
+```
+Milestone: PENDING
+  ↓ (seller signals readiness)
+AWAITING_PROOF
+  ↓ (seller uploads proof files → stored as R2 URLs in proofSubmitted[])
+PROOF_SUBMITTED
+  ↓ (buyer reviews)
+  ├── APPROVED (buyer accepts)
+  │     ↓ (admin triggers payment release)
+  │   PAYMENT_RELEASED
+  │
+  └── REJECTED (buyer rejects with rejectionReason)
+        ↓ (seller may resubmit or raise dispute)
+      [loop back to AWAITING_PROOF] or [DISPUTED]
+```
+
+Proof files are uploaded via the R2 presigned URL flow: client calls `POST /api/uploads/presigned` → receives a time-limited signed URL → uploads directly to R2 → stores the resulting R2 URL in the milestone record. No proof file data passes through the application server.
+
+Payment release is a manual admin action (not automatic) to allow for compliance review before funds move. The admin calls the milestone payment release route after verifying the approval.
+
+---
+
+## Dispute Resolution Flow
+
+Either party can raise a dispute against a specific `Milestone`. The dispute flows through an admin adjudication process.
+
+```
+Milestone: PROOF_SUBMITTED
+  ↓ (buyer raises dispute)
+Milestone.disputed = true, status → DISPUTED
+DisputeResolution created → status: RAISED
+
+  ↓ (admin claims the dispute)
+UNDER_REVIEW  +  DisputeAssignment record (type: INITIAL)
+
+  ↓ (admin may request more evidence)
+AWAITING_EVIDENCE
+
+  ↓ (admin resolves OR escalates)
+  ├── RESOLVED
+  │     outcome: BUYER_FAVOR | SELLER_FAVOR | PARTIAL_REFUND | SPLIT_DECISION | NO_FAULT
+  │     resolvedAt, resolvedBy set
+  │     payment consequence applied based on outcome
+  │
+  └── ESCALATED
+        DisputeAssignment record (type: ESCALATION)
+        Only SUPER_ADMIN role can resolve escalated disputes
+```
+
+### Admin roles in dispute resolution
+
+`AdminRole.DISPUTE_RESOLVER` can claim, investigate, request evidence, and resolve standard disputes. `AdminRole.SUPER_ADMIN` is required to resolve escalated disputes. Role enforcement is checked via `src/lib/admin/permissions.ts` before all admin dispute actions.
+
+### Dispute outcomes
+
+| Outcome | Effect |
+|---|---|
+| BUYER_FAVOR | Funds returned to buyer |
+| SELLER_FAVOR | Funds released to seller |
+| PARTIAL_REFUND | Agreed split, buyer receives partial return |
+| SPLIT_DECISION | Funds split proportionally |
+| NO_FAULT | Funds held pending further resolution |
+
+---
+
+## Sample Payment Flow
+
+Before the price stage, an optional sample stage allows the buyer to inspect physical goods. If the seller charges for the sample, a separate `SampleRequest` payment flow runs:
+
+```
+SampleRequest.paymentStatus:
+  PENDING → PAID → [delivered] → [buyer decision]
+                 → FAILED
+                 → REFUNDED (if sample rejected)
+```
+
+`SampleRequest.status` runs in parallel:
+```
+REQUESTED → PAYMENT_CONFIRMED → SELLER_PREPARING → SHIPPED → IN_TRANSIT → DELIVERED → APPROVED | REJECTED
+```
+
+A rejected sample returns the inquiry to `SAMPLE_REJECTED` status. The buyer can then proceed to price negotiation without a sample (same as `skipSample()`) or withdraw.
