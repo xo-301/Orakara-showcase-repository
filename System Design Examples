@@ -97,7 +97,7 @@ Three Vercel Cron jobs run the time-sensitive background processes:
 | Job | Schedule | What it does |
 |---|---|---|
 | `/api/cron/timers` | Every 5 min | Expires timers, records failures, sends timer warnings |
-| `/api/cron/holidays` | Daily at 18:00 | Pauses / resumes all active timers per country based on holiday calendar |
+| `/api/cron/holidays` | Daily at 18:00 | Pauses / resumes all active timers per country based on holiday calendar | (in fluz, may be discarded)
 | `/api/cron/rfq-expiry` | Every 15 min | Marks stale RFQs as expired |
 
 All three converge in `src/lib/cron/index.ts → runAllCronJobs()`. Each job writes an `AuditLog` record on completion. Timer expiry is idempotent — re-running on an already-expired timer is a no-op.
