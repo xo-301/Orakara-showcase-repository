@@ -67,7 +67,7 @@ orakara-mobile/            ← Expo React Native app
 
 | Document | What it covers |
 |---|---|
-| [SYSTEM_DESIGN.md]([docs/SYSTEM_DESIGN.md](https://github.com/xo-301/Orakara-showcase-repository/blob/332b45931f8ffe47964b6e2f47d3c3b7958596e2/System%20Design%20Examples)) | Architecture decisions, key tradeoffs, design philosophy |
+| [SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN_EXAMPLES.md) | Architecture decisions, key tradeoffs, design philosophy |
 | [NEGOTIATION_ENGINE.md](docs/NEGOTIATION_ENGINE.md) | State machine, turn tracking, timer logic |
 | [PAYMENT_ARCHITECTURE.md](docs/PAYMENT_ARCHITECTURE.md) | Escrow, milestones, proof-gated releases, dispute flow |
 | [ANALYTICS_PIPELINE.md](docs/ANALYTICS_PIPELINE.md) | Failure detection, F1 scoring, research export |
