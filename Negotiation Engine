@@ -1,0 +1,253 @@
+# Negotiation Engine — Orakara
+
+## Overview
+
+The negotiation engine is the core of Orakara. It governs how a buyer and seller move from an initial inquiry to a signed deal, enforcing stage sequencing, turn ownership, and time boundaries at every step.
+
+The engine is implemented as a deterministic state machine in `src/lib/negotiationOrchestrator.ts`, with a companion `src/lib/dealFlow.ts` handling post-deal milestone progression.
+
+---
+
+## Stage Sequence
+
+Every negotiation passes through stages in order. A stage cannot be entered until the preceding stage is complete. A stage cannot be skipped except where explicitly permitted (sample is optional).
+
+```
+PENDING
+  ↓ (seller may request clarification first)
+CLARIFICATION_NEEDED → CLARIFICATION_ANSWERED
+  ↓
+RESPONDED
+  ↓ (buyer initiates negotiation)
+NEGOTIATING_SPECS
+  ↓ (all specs agreed + timer not expired)
+SAMPLE_REQUESTED ──(optional)──→ SAMPLE_APPROVED
+         ↓ (or buyer skips sample)           ↓
+         └──────────────────────────→ NEGOTIATING_PRICE
+                                             ↓ (price + payment mode + quantity + lead time + tranches agreed)
+                                      NEGOTIATING_CONTRACT
+                                             ↓ (both parties sign or skip + timer expires)
+                                        DEAL_CREATED
+
+At any active stage:
+  → WITHDRAWN   (either party withdraws)
+  → EXPIRED     (timer reaches deadline)
+  → FAILED      (final offer rejected / system timeout)
+  → DECLINED    (seller declines at intake)
+```
+
+---
+
+## All Status Transitions
+
+### Inquiry intake
+
+| From | To | Trigger | File |
+|---|---|---|---|
+| PENDING | CLARIFICATION_NEEDED | Seller requests clarification | `api/inquiries/[id]/clarify/route.ts` |
+| PENDING / CLARIFICATION_ANSWERED | RESPONDED | Seller submits SellerResponse | `api/inquiries/[id]/respond/route.ts` |
+| PENDING | DECLINED | Seller declines | `api/inquiries/[id]/decline/route.ts` |
+
+### Specs stage
+
+| From | To | Trigger | Condition |
+|---|---|---|---|
+| RESPONDED | NEGOTIATING_SPECS | Buyer initiates spec negotiation | — |
+| NEGOTIATING_SPECS | SAMPLE_REQUESTED | `progressToSample()` | `canProgressToSample()` passes: all specs agreed, timer not expired |
+| NEGOTIATING_SPECS | NEGOTIATING_SPECS | `reopenSpecs()` | Dispute detected in later stage; `specsReopenCount++`, prior price offers voided |
+
+### Sample stage (optional)
+
+| From | To | Trigger | Condition |
+|---|---|---|---|
+| SAMPLE_REQUESTED | SAMPLE_APPROVED | `approveSample()` | Buyer approves; PRICE_PAYMENT timer created |
+| SAMPLE_REQUESTED | SAMPLE_REJECTED | Buyer rejects | — |
+| SAMPLE_REQUESTED | NEGOTIATING_PRICE | `skipSample()` | Buyer opts to skip; PRICE_PAYMENT timer created |
+
+### Price + payment stage
+
+| From | To | Trigger | Condition |
+|---|---|---|---|
+| SAMPLE_APPROVED / NEGOTIATING_PRICE | NEGOTIATING_PRICE | Initial or counter price offer | — |
+| NEGOTIATING_PRICE | NEGOTIATING_CONTRACT | `acceptPriceOffer()` (final accept) | `isPricePaymentAgreed()`: all four fields agreed + tranches agreed if PLATFORM_ESCROW |
+
+### Contract stage
+
+| From | To | Trigger | Condition |
+|---|---|---|---|
+| NEGOTIATING_CONTRACT | DEAL_CREATED | `signContract()` | Both parties signed, or both signal skip intent, or contract timer expires |
+| DEAL_CREATED | DealStatus.ACTIVE | `createDealFromInquiry()` | Automatic on Deal record creation |
+
+### Terminal
+
+| From | To | Trigger | Condition |
+|---|---|---|---|
+| Any active | WITHDRAWN | `withdrawInquiry()` / `sellerWithdraw()` | Party calls withdrawal; `failureReason` + `WithdrawalReason` record written |
+| Any active | EXPIRED / FAILED | `processExpiredTimers()` | `NegotiationTimer.deadline < now` AND `paused = false` |
+| NEGOTIATING_PRICE | FAILED | Final offer rejected | Counterparty rejects a locked final offer |
+
+---
+
+## Per-Spec Negotiation
+
+Within the NEGOTIATING_SPECS stage, each specification item is negotiated independently. Each `SpecNegotiation` record tracks one spec item and has its own status lifecycle.
+
+### Spec item statuses
+
+```
+PENDING
+  ↓ (either party counters)
+COUNTERED
+  ↓ (counterparty accepts)        ↓ (counterparty rejects)       ↓ (either party locks)
+AGREED                          REJECTED                   FINAL_OFFER_PENDING
+                                                                 ↓           ↓
+                                                          FINAL_OFFER_    FINAL_OFFER_
+                                                           ACCEPTED        REJECTED
+```
+
+### Final-offer grim trigger
+
+When a party issues a final offer on a spec item, the item enters `FINAL_OFFER_PENDING`. The counterparty can only accept or reject — no further counter is possible. If rejected, the entire negotiation fails. This is a credible commitment device: it gives each party one opportunity to draw a firm line, with the consequence of failure as enforcement.
+
+Hard-constraint specs (`SpecType.HARD_CONSTRAINT`) follow the same flow but are flagged at creation — if the buyer's hard constraint cannot be met, the system can infer this as the primary failure cause.
+
+### Spec actions recorded
+
+Every action on every spec item creates a `SpecNegotiationHistory` record: `INITIAL`, `ACCEPT`, `COUNTER`, `REJECT`, `DELETE`, `FINAL_OFFER`, `FINAL_ACCEPT`, `FINAL_REJECT`, `HC_ACCEPT`, `HC_REJECT`.
+
+---
+
+## Turn Tracking
+
+Turn enforcement ensures that only the party whose turn it is can take action. A party cannot act twice in a row.
+
+### Fields (on `Inquiry` model)
+
+```
+specNegotiationTurn      String   — userId of the party whose turn it is
+specNegotiationTurnRole  String   — "buyer" | "seller"
+priceNegotiationTurn     String   — same, for price stage
+priceNegotiationTurnRole String
+```
+
+Per-dimension fields in `PriceNegotiation`:
+
+```
+priceAwaitingRole         String
+paymentModeAwaitingRole   String
+quantityAwaitingRole      String
+leadTimeAwaitingRole      String
+```
+
+Each escrow tranche (`EscrowTranche`) also has its own `awaitingRole` field.
+
+### Flip mechanism
+
+`validateAndTransferTurn(inquiryId, actorId, actorRole)` in `negotiationOrchestrator.ts`:
+
+1. Reads current `specNegotiationTurn` from `Inquiry`
+2. Asserts `actorId === specNegotiationTurn` — throws HTTP 403 if not
+3. Atomically updates `specNegotiationTurn` to the counterparty's userId and `specNegotiationTurnRole` to the counterparty's role
+4. All within the same Prisma transaction as the state mutation
+
+### RFQ exception
+
+Turn enforcement is suppressed for the SPECS and PRICE stages on RFQ-sourced inquiries (`Inquiry.rfqBidId` is set). Only the CONTRACT stage enforces turn order for RFQ deals. This reflects the different negotiation dynamic of a competitive bid response versus a bilateral negotiation.
+
+---
+
+## Timer System
+
+Every negotiation stage has a time boundary. When the timer expires, the inquiry fails automatically. Timers support pause, resume, extension requests, holiday awareness, and admin override.
+
+### Timer fields (`NegotiationTimer`)
+
+```
+startedAt        DateTime   — creation timestamp
+deadline         DateTime   — hard expiry (startedAt + configured hours per stage)
+paused           Boolean    — current pause state
+pausedAt         DateTime   — when paused
+remainingSeconds Int        — seconds remaining, stored at pause time; cleared on resume
+expired          Boolean    — set true by cron
+expiredAt        DateTime   — when marked expired
+```
+
+### Pause logic
+
+```typescript
+// pauseTimer(timerId)
+const remainingMs = deadline.getTime() - Date.now();
+const remainingSeconds = Math.floor(remainingMs / 1000);
+await prisma.negotiationTimer.update({
+  where: { id: timerId },
+  data: { paused: true, pausedAt: new Date(), remainingSeconds }
+});
+```
+
+### Resume logic
+
+```typescript
+// resumeTimer(timerId)
+const newDeadline = new Date(Date.now() + timer.remainingSeconds * 1000);
+await prisma.negotiationTimer.update({
+  where: { id: timerId },
+  data: {
+    paused: false,
+    pausedAt: null,
+    remainingSeconds: null,
+    deadline: newDeadline
+  }
+});
+```
+
+Resuming always resets the deadline to `now + remainingSeconds`. The original `startedAt` is preserved as a record but the effective expiry moves forward.
+
+### Expiry check
+
+```typescript
+function isTimerExpired(timer: NegotiationTimer): boolean {
+  if (timer.paused) return false; // paused timers can never expire
+  return new Date() > timer.deadline;
+}
+```
+
+A paused timer is immune to expiry. This is the invariant that makes holiday pausing safe — no deal can be timed out while timers are paused.
+
+### Extension flow
+
+Either party can request a 24-hour extension via `POST /api/inquiries/[id]/timer/extend`. The counterparty must accept. If accepted, `deadline += 24 hours` (added to the *current* deadline, not to now). A `TimerExtension` record is created with `ExtensionStatus.PENDING` → `ACCEPTED` / `DECLINED`.
+
+Admin can override without counterparty consent via `POST /api/admin/timers/[timerId]/extend`, logged to `AdminTimerOverride` and `AuditLog`.
+
+### Holiday pausing
+
+`processHolidayStart(countryCode)` pauses *all* active timers for that country atomically using the same pause mechanism. `processHolidayEnd()` resumes all. Holiday management is admin-controlled via `POST /api/admin/holidays`. The cron job at 18:00 daily checks for holidays starting or ending the next day and triggers the appropriate action.
+
+### Admin overrides
+
+`adminOverrideTimer(timerId, action)` supports:
+
+| Action | Effect |
+|---|---|
+| PAUSE | Pause with current remainingSeconds |
+| RESUME | Resume, reset deadline to now + remainingSeconds |
+| EXTEND | Add N hours to current deadline |
+| RESET | Restart timer from zero for the stage's configured hours |
+
+All admin actions are logged to `AdminTimerOverride` (with `hoursAdded`, `originalDeadline`, `newDeadline`) and `AuditLog` (with `userId = 'SYSTEM'`).
+
+---
+
+## Stage-Configured Timer Hours
+
+Stage timer durations are configurable per `CountryConfig` via fields on the `Inquiry` model:
+
+```
+specsRoundHours       Int   — hours per specs negotiation round
+sampleApprovalHours   Int   — hours for sample approval
+priceRoundHours       Int   — hours per price negotiation round
+contractRoundHours    Int   — hours for contract signing
+reorderRoundHours     Int   — hours for reorder negotiation
+```
+
+This allows country-specific defaults without code changes — Bangladesh may have different standard negotiation cadences than a future market expansion.
