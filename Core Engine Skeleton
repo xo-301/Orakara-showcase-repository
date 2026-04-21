@@ -1,0 +1,300 @@
+/**
+ * ORAKARA — ANONYMISED CODE EXCERPTS
+ *
+ * These are representative excerpts from the Orakara codebase,
+ * anonymised for public sharing. Identifiers, constants, and
+ * business-specific values have been generalised. The logic and
+ * structure accurately reflect the production implementation.
+ */
+
+// ─────────────────────────────────────────────────────────────────
+// 1. NEGOTIATION STAGE GATE — isPricePaymentAgreed()
+//    Validates all four price-stage dimensions before allowing
+//    transition to the contract stage.
+//    File: src/lib/negotiationOrchestrator.ts
+// ─────────────────────────────────────────────────────────────────
+
+import { PriceFieldStatus, PaymentMethod } from "@prisma/client";
+
+type PriceNegotiationWithTranches = {
+  priceStatus: PriceFieldStatus;
+  paymentModeStatus: PriceFieldStatus;
+  quantityStatus: PriceFieldStatus;
+  leadTimeStatus: PriceFieldStatus;
+  agreedPaymentMode: PaymentMethod | null;
+  escrowTranches: { status: PriceFieldStatus }[];
+};
+
+function isPricePaymentAgreed(pn: PriceNegotiationWithTranches): boolean {
+  const coreFieldsAgreed =
+    pn.priceStatus === PriceFieldStatus.AGREED &&
+    pn.paymentModeStatus === PriceFieldStatus.AGREED &&
+    pn.quantityStatus === PriceFieldStatus.AGREED &&
+    pn.leadTimeStatus === PriceFieldStatus.AGREED;
+
+  if (!coreFieldsAgreed) return false;
+
+  // If platform escrow was selected, ALL tranches must also be agreed
+  // before the gate opens. No partial tranche agreement is accepted.
+  if (pn.agreedPaymentMode === PaymentMethod.PLATFORM_ESCROW) {
+    const activeTranches = pn.escrowTranches.filter((t) => !("deleted" in t));
+    if (activeTranches.length === 0) return false;
+    return activeTranches.every((t) => t.status === PriceFieldStatus.AGREED);
+  }
+
+  return true;
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+// 2. TURN VALIDATION AND TRANSFER
+//    Verifies the acting party holds the current turn, then
+//    atomically flips turn ownership to the counterparty.
+//    File: src/lib/negotiationOrchestrator.ts
+// ─────────────────────────────────────────────────────────────────
+
+import { prisma } from "@/lib/prisma";
+
+async function validateAndTransferTurn(
+  inquiryId: string,
+  actorId: string,
+  actorRole: "buyer" | "seller",
+  stage: "spec" | "price"
+): Promise<void> {
+  const turnField =
+    stage === "spec" ? "specNegotiationTurn" : "priceNegotiationTurn";
+  const roleField =
+    stage === "spec" ? "specNegotiationTurnRole" : "priceNegotiationTurnRole";
+
+  const inquiry = await prisma.inquiry.findUniqueOrThrow({
+    where: { id: inquiryId },
+    select: { [turnField]: true, [roleField]: true },
+  });
+
+  if (inquiry[turnField] !== actorId) {
+    throw new Error(`NOT_YOUR_TURN`); // mapped to HTTP 403 in route handler
+  }
+
+  const counterpartyRole = actorRole === "buyer" ? "seller" : "buyer";
+  const counterpartyIdField =
+    counterpartyRole === "buyer" ? "buyerId" : "sellerId";
+
+  const fullInquiry = await prisma.inquiry.findUniqueOrThrow({
+    where: { id: inquiryId },
+    select: { [counterpartyIdField]: true },
+  });
+
+  await prisma.inquiry.update({
+    where: { id: inquiryId },
+    data: {
+      [turnField]: fullInquiry[counterpartyIdField],
+      [roleField]: counterpartyRole,
+    },
+  });
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+// 3. TIMER PAUSE AND RESUME
+//    Stores remaining time at pause; reconstructs deadline on resume.
+//    File: src/lib/negotiationOrchestrator.ts
+// ─────────────────────────────────────────────────────────────────
+
+async function pauseTimer(timerId: string): Promise<void> {
+  const timer = await prisma.negotiationTimer.findUniqueOrThrow({
+    where: { id: timerId },
+  });
+
+  if (timer.paused || timer.expired) return; // idempotent
+
+  const remainingMs = timer.deadline.getTime() - Date.now();
+  const remainingSeconds = Math.max(0, Math.floor(remainingMs / 1000));
+
+  await prisma.negotiationTimer.update({
+    where: { id: timerId },
+    data: {
+      paused: true,
+      pausedAt: new Date(),
+      remainingSeconds,
+    },
+  });
+}
+
+async function resumeTimer(timerId: string): Promise<void> {
+  const timer = await prisma.negotiationTimer.findUniqueOrThrow({
+    where: { id: timerId },
+  });
+
+  if (!timer.paused || timer.expired) return; // idempotent
+
+  const newDeadline = new Date(
+    Date.now() + (timer.remainingSeconds ?? 0) * 1000
+  );
+
+  await prisma.negotiationTimer.update({
+    where: { id: timerId },
+    data: {
+      paused: false,
+      pausedAt: null,
+      remainingSeconds: null,
+      deadline: newDeadline,
+    },
+  });
+}
+
+function isTimerExpired(timer: {
+  paused: boolean;
+  deadline: Date;
+}): boolean {
+  if (timer.paused) return false; // paused timers are immune to expiry
+  return new Date() > timer.deadline;
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+// 4. SPEC DISPUTE INFERENCE — inferSpecsDisputes()
+//    Matches clarification question text against spec labels to
+//    infer which specs drove the negotiation failure.
+//    File: src/lib/failureTracking.ts
+// ─────────────────────────────────────────────────────────────────
+
+type Clarification = {
+  questions: string[];
+};
+
+type SpecNegotiation = {
+  specKey: string;
+  specLabel: string;
+};
+
+type InferredDispute = {
+  specKey: string;
+  confidence: number; // 0.0 – 1.0
+  evidence: string[];
+};
+
+function inferSpecsDisputes(
+  clarifications: Clarification[],
+  specNegotiations: SpecNegotiation[]
+): InferredDispute[] {
+  const results = new Map<string, InferredDispute>();
+
+  for (const clarification of clarifications) {
+    for (const question of clarification.questions) {
+      for (const spec of specNegotiations) {
+        if (question.toLowerCase().includes(spec.specLabel.toLowerCase())) {
+          const existing = results.get(spec.specKey) ?? {
+            specKey: spec.specKey,
+            confidence: 0,
+            evidence: [],
+          };
+          existing.confidence = Math.min(existing.confidence + 0.2, 1.0);
+          existing.evidence.push(question);
+          results.set(spec.specKey, existing);
+        }
+      }
+    }
+  }
+
+  return [...results.values()].sort((a, b) => b.confidence - a.confidence);
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+// 5. F1 SCORE CALCULATION — compareSpecsDisputes()
+//    Measures agreement between system-inferred spec disputes
+//    and user-reported spec disputes at withdrawal.
+//    File: src/lib/failureTracking.ts
+// ─────────────────────────────────────────────────────────────────
+
+type ComparisonResult = {
+  systemOnly: string[];
+  userOnly: string[];
+  agreement: string[];
+  precision: number;
+  recall: number;
+  f1Score: number;
+};
+
+function compareSpecsDisputes(
+  systemInferred: InferredDispute[],
+  userReported: string[] // specKeys provided by the withdrawing party
+): ComparisonResult {
+  const systemKeys = new Set(systemInferred.map((d) => d.specKey));
+  const userKeys = new Set(userReported);
+
+  const truePositives = [...systemKeys].filter((k) => userKeys.has(k)).length;
+  const falsePositives = [...systemKeys].filter((k) => !userKeys.has(k)).length;
+  const falseNegatives = [...userKeys].filter((k) => !systemKeys.has(k)).length;
+
+  const precision =
+    truePositives + falsePositives > 0
+      ? truePositives / (truePositives + falsePositives)
+      : 0;
+
+  const recall =
+    truePositives + falseNegatives > 0
+      ? truePositives / (truePositives + falseNegatives)
+      : 0;
+
+  const f1Score =
+    precision + recall > 0
+      ? (2 * precision * recall) / (precision + recall)
+      : 0;
+
+  return {
+    systemOnly: [...systemKeys].filter((k) => !userKeys.has(k)),
+    userOnly: [...userKeys].filter((k) => !systemKeys.has(k)),
+    agreement: [...systemKeys].filter((k) => userKeys.has(k)),
+    precision,
+    recall,
+    f1Score,
+  };
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+// 6. FAILURE INITIATOR CLASSIFICATION
+//    Maps failure type to the responsible party.
+//    File: src/lib/failureTracking.ts
+// ─────────────────────────────────────────────────────────────────
+
+import { FailureType, FailureInitiator } from "@prisma/client";
+
+type FailureContext = {
+  failureType: FailureType;
+  userRole?: "buyer" | "seller"; // set on withdrawal
+  finalOfferBy?: string;         // userId who triggered final offer
+  buyerId: string;
+  sellerId: string;
+};
+
+function determineFailureInitiator(
+  context: FailureContext
+): FailureInitiator {
+  switch (context.failureType) {
+    case FailureType.WITHDRAWAL:
+      return context.userRole === "buyer"
+        ? FailureInitiator.BUYER
+        : FailureInitiator.SELLER;
+
+    case FailureType.TIMEOUT:
+      return FailureInitiator.SYSTEM;
+
+    case FailureType.FINAL_OFFER_REJECTED:
+      // The initiator is the party who *rejected* the final offer,
+      // i.e. the counterparty of the one who made it
+      if (!context.finalOfferBy) return FailureInitiator.SYSTEM;
+      return context.finalOfferBy === context.buyerId
+        ? FailureInitiator.SELLER   // seller rejected buyer's final offer
+        : FailureInitiator.BUYER;   // buyer rejected seller's final offer
+
+    case FailureType.DECLINE:
+      return context.userRole === "buyer"
+        ? FailureInitiator.BUYER
+        : FailureInitiator.SELLER;
+
+    default:
+      return FailureInitiator.SYSTEM;
+  }
+}
