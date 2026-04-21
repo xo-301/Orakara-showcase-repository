@@ -1,0 +1,215 @@
+## Overview
+
+Every negotiation failure on Orakara — whether caused by withdrawal, timeout, final-offer rejection, or explicit decline — is recorded with a structured set of objective and subjective metrics. This data serves two purposes: internal product learning (understanding *why* deals collapse) and institutional research export (anonymised, PII-stripped datasets for academic or regulatory use).
+
+The pipeline's most technically interesting component is the **F1 failure detection system** for spec-stage disputes, which cross-references system-inferred disagreement signals against user-reported failure causes and scores the overlap.
+
+---
+
+## Data Inputs
+
+### Objective metrics (computed at failure time)
+
+Calculated by `calculateFailureAnalytics()` in `src/lib/failureTracking.ts` at the moment of failure:
+
+| Field | Type | Source |
+|---|---|---|
+| `failureStage` | `NegotiationStage` | Current `Inquiry` stage at failure |
+| `failureType` | `FailureType` | WITHDRAWAL / TIMEOUT / FINAL_OFFER_REJECTED / DECLINE |
+| `failureRound` | Int | `PriceNegotiation.round` at failure |
+| `roundsCompleted` | Int | Total price offer exchanges in `PriceNegotiation` |
+| `totalDurationMinutes` | Int | `negotiationStartedAt` → `failedAt` |
+| `extensionsRequested` | Int | Count of `TimerExtension` records for this inquiry |
+| `extensionsGranted` | Int | Count of `TimerExtension` records with `status: ACCEPTED` |
+| `timeRemainingSeconds` | Int | `NegotiationTimer.remainingSeconds` at expiry, or computed at withdrawal |
+| `lastBuyerPrice` | Decimal | `PriceNegotiation.buyerPrice` at failure |
+| `lastSellerPrice` | Decimal | `PriceNegotiation.sellerPrice` at failure |
+| `priceGapPercent` | Decimal | `abs((sellerPrice - buyerPrice) / sellerPrice) * 100` |
+| `paymentModeDispute` | Boolean | True if buyer's offered modes never overlapped with seller's |
+| `finalOfferTriggered` | Boolean | Whether a final offer was issued before failure |
+| `finalOfferBy` | String | userId of the party who triggered the final offer |
+| `finalOfferDimension` | `FinalOfferDimensionType` | PRICE / PAYMENT_MODE / TRANCHE |
+
+### Subjective metrics (user-provided withdrawal form)
+
+Collected when either party calls `withdrawInquiry()`:
+
+| Field | Type | Options |
+|---|---|---|
+| `primaryReason` | `WithdrawalReasonType` | 23 categories (see below) |
+| `secondaryReason` | `WithdrawalReasonType` | Optional second reason |
+| `wouldWorkWithAgain` | `WorkWithAgain` | YES / MAYBE / NO |
+
+`WithdrawalReasonType` covers: `PRICE_COMMERCIAL`, `SPECS_MISMATCH`, `TIMELINE_CONSTRAINTS`, `PAYMENT_TERMS`, `FOUND_ALTERNATIVE`, `ORDER_CANCELLED`, `COUNTERPARTY_CONCERNS`, `UNRESPONSIVE`, `CHANGED_CIRCUMSTANCES`, `OUTSIDE_CAPABILITY`, `MOQ_NOT_MET`, `PRODUCT_DISCONTINUED`, `SAMPLE_UNAVAILABLE`, `COST_PROHIBITIVE`, `QUALITY_BELOW_EXPECTATION`, `DOESNT_MATCH_SPECS`, `DEFECTS_FOUND`, `PRICE_ABOVE_BUDGET`, `CANNOT_MATCH_COMPETITOR`, `TERMS_UNACCEPTABLE`, `LEGAL_REJECTED`, `DOCUMENTATION_REQUIRED`, `OTHER`
+
+### Stage-specific supplemental data
+
+For SPECS failures: a `SpecsFailureDetail` record is created alongside `NegotiationFailure`.
+For CONTRACT failures: a `ContractFailureDetail` record is created.
+
+---
+
+## System Spec Dispute Inference
+
+When a negotiation fails at the specs stage, the system attempts to infer *which* specs were the source of disagreement — without relying solely on what the user reports.
+
+### How `inferSpecsDisputes()` works
+
+```typescript
+// Pseudocode — src/lib/failureTracking.ts
+function inferSpecsDisputes(inquiry: InquiryWithRelations): InferredDispute[] {
+  const results: Map<string, InferredDispute> = new Map();
+
+  for (const clarification of inquiry.clarifications) {
+    for (const question of clarification.questions) {
+      for (const spec of inquiry.specNegotiations) {
+        // Case-insensitive match between clarification question text and spec label
+        if (question.toLowerCase().includes(spec.specLabel.toLowerCase())) {
+          const existing = results.get(spec.specKey) ?? {
+            specKey: spec.specKey,
+            confidence: 0,
+            evidence: []
+          };
+          existing.confidence = Math.min(existing.confidence + 0.2, 1.0); // cap at 1.0
+          existing.evidence.push(question);
+          results.set(spec.specKey, existing);
+        }
+      }
+    }
+  }
+
+  return [...results.values()].sort((a, b) => b.confidence - a.confidence);
+}
+```
+
+Each time a clarification question text matches a spec label, confidence for that spec increases by 0.2, capped at 1.0. A spec with 5+ matching clarification questions reaches maximum confidence.
+
+The output is an ordered list of `{ specKey, confidence: 0–1, evidence: string[] }` representing the system's assessment of which specs drove the failure.
+
+---
+
+## F1 Score Calculation
+
+The system-inferred dispute list and the user-reported dispute list are compared using precision, recall, and F1 score. This measures how well the system's inference matches what the withdrawing party actually cited.
+
+### `compareSpecsDisputes()` — full logic
+
+```typescript
+function compareSpecsDisputes(
+  systemInferred: InferredDispute[],    // from inferSpecsDisputes()
+  userReported: string[]                // specKeys from withdrawal form
+): ComparisonResult {
+  const systemKeys = new Set(systemInferred.map(d => d.specKey));
+  const userKeys   = new Set(userReported);
+
+  const truePositives  = [...systemKeys].filter(k => userKeys.has(k)).length;
+  const falsePositives = [...systemKeys].filter(k => !userKeys.has(k)).length;
+  const falseNegatives = [...userKeys].filter(k => !systemKeys.has(k)).length;
+
+  const precision = truePositives / (truePositives + falsePositives) || 0;
+  const recall    = truePositives / (truePositives + falseNegatives) || 0;
+  const f1Score   = (precision + recall > 0)
+    ? 2 * (precision * recall) / (precision + recall)
+    : 0;
+
+  return {
+    systemOnly:  [...systemKeys].filter(k => !userKeys.has(k)),
+    userOnly:    [...userKeys].filter(k => !systemKeys.has(k)),
+    agreement:   [...systemKeys].filter(k =>  userKeys.has(k)),
+    precision,
+    recall,
+    f1Score
+  };
+}
+```
+
+The result is stored in `SpecsFailureDetail.comparison` as JSON:
+
+```json
+{
+  "systemOnly":  ["packagingType"],
+  "userOnly":    ["colorSpec"],
+  "agreement":   ["tensileStrength", "moistureContent"],
+  "precision":   0.67,
+  "recall":      0.5,
+  "f1Score":     0.57
+}
+```
+
+Over time, the aggregate F1 score distribution tells us how well the clarification-based inference model predicts actual spec disputes — and where it systematically misses.
+
+---
+
+## Failure Initiator Classification
+
+`determineFailureInitiator(context)` maps failure type to the party responsible:
+
+| FailureType | Initiator |
+|---|---|
+| WITHDRAWAL | `context.userRole` (BUYER or SELLER — whoever withdrew) |
+| TIMEOUT | SYSTEM |
+| FINAL_OFFER_REJECTED | Opposite of `finalOfferBy` (the party who rejected) |
+| DECLINE | Invoking user's role |
+
+This is stored in `NegotiationFailure.initiatedBy` (`FailureInitiator` enum: BUYER / SELLER / SYSTEM).
+
+---
+
+## Where It Runs
+
+| Job | Trigger | File |
+|---|---|---|
+| Timer expiry + failure recording | Vercel Cron every 5 min | `src/lib/cron/timer-expiry.ts` |
+| Extension expiry | Bundled with timer expiry | `src/lib/cron/extension-expiry.ts` |
+| Timer warning notifications | Bundled with timer expiry | `src/lib/cron/warning-processor.ts` |
+| Holiday pause/resume | Vercel Cron daily at 18:00 | `src/lib/cron/holiday-processor.ts` |
+| Combined orchestrator | Called by cron routes | `src/lib/cron/index.ts → runAllCronJobs()` |
+
+All cron actions write an `AuditLog` record with `userId = 'SYSTEM'`. Timer expiry processing is idempotent — re-running on an already-expired timer is a no-op.
+
+---
+
+## Output and Storage
+
+### `NegotiationFailure` record
+
+Written to the database with 20+ fields for every failure event. Linked 1:1 to the `Inquiry`. Includes objective metrics, initiator, and references to stage-specific detail records.
+
+### Admin aggregation — `getFailureAnalytics(filters)`
+
+Returns aggregated statistics for the admin analytics dashboard:
+
+```typescript
+{
+  totalFailures: number,
+  avgDuration: number,         // minutes
+  avgRounds: number,
+  avgPriceGap: number,         // percent
+  byReason: {
+    [WithdrawalReasonType]: number   // failure count per reason
+  },
+  failures: NegotiationFailure[]     // full records for table view
+}
+```
+
+### Research export — `exportFailureDataAnonymized(filters)`
+
+Strips all PII before returning. Output schema:
+
+```typescript
+{
+  stage: NegotiationStage,
+  type: FailureType,
+  round: number,
+  duration: number,      // minutes
+  rounds: number,
+  priceGap: number,      // percent
+  reason: WithdrawalReasonType,
+  category: string,      // product category (not company/user identifiers)
+  specCount: number      // number of specs in negotiation
+}[]
+```
+
+Export formats supported: CSV, XLSX, JSON, Parquet (via Apache Arrow + parquetjs-lite). The `InternalResearchExport` and `ExternalDataExport` models track all export events with recipient details, anonymisation method, record count, and file checksum for audit purposes.
+
+Export access is gated to `AdminRole.ANALYST` and above, checked via `src/lib/admin/permissions.ts`.
