@@ -67,11 +67,12 @@ orakara-mobile/            ← Expo React Native app
 
 | Document | What it covers |
 |---|---|
-| [SYSTEM_DESIGN EXAMPLES](docs/SYSTEM_DESIGN_EXAMPLES) | Architecture decisions, key tradeoffs, design philosophy |
-| [NEGOTIATION_ENGINE.md](docs/NEGOTIATION_ENGINE.md) | State machine, turn tracking, timer logic |
-| [PAYMENT_ARCHITECTURE.md](docs/PAYMENT_ARCHITECTURE.md) | Escrow, milestones, proof-gated releases, dispute flow |
-| [ANALYTICS_PIPELINE.md](docs/ANALYTICS_PIPELINE.md) | Failure detection, F1 scoring, research export |
-
+| [SYSTEM DESIGN EXAMPLES](docs/SYSTEM_DESIGN_EXAMPLES) | Architecture decisions, key tradeoffs, design philosophy |
+| [NEGOTIATION_ENGINE](docs/NEGOTIATION_ENGINE) | State machine, turn tracking, timer logic |
+| [PAYMENT_ARCHITECTURE](docs/PAYMENT_ARCHITECTURE) | Escrow, milestones, proof-gated releases, dispute flow |
+| [ANALYTICS_PIPELINE.md](docs/NON-EXHAUSTIVE_ANALYTICS_PIPELINE) | Failure detection, F1 scoring, research export |
+## Code Snippets
+| [CORE ENGINE SKELETON](snippets/CORE_ENGINE_SKELETON) |
 ---
 
 ## Build Status
